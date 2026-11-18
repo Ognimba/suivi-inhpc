@@ -1,21 +1,68 @@
 """
 Lecture des données KoboToolbox et construction de la base de suivi
 Enquête sur l'identification des points de vente (INHPC) – INS Congo
+Application réalisée par OGNIMBA Sadri
 
 Ce module ne dépend pas de Streamlit : il peut être testé seul.
+
+Contenu :
+  1. Lecture de l'API KoboToolbox
+  2. Libellés des questions et des choix
+  3. Détection automatique des colonnes
+  4. Libellés courts et ordre des types de PV
+  5. Construction de la base de suivi + contrôles qualité
+     (+ produits cochés, identifiant de PV distinct, contrôles d'envoi et d'horloge)
+  6. Tableaux d'analyse (types, validation, performance)
+  7. Règle des 3 points de vente par produit
+  8. Alertes sur les envois (tardifs, silences, heure de tablette, fiches rouvertes)
+  9. Export Excel de la règle des 3 PV
 """
 from __future__ import annotations
 
+import io
 import math
 import re
 import time
 import unicodedata
-from datetime import datetime, timedelta
+from collections import Counter
 
 import pandas as pd
 import requests
 
 FUSEAU = "Africa/Brazzaville"
+
+STATUTS = ["Approuvé", "Non approuvé", "En attente", "Non vérifié"]
+_STATUT_UID = {
+    "validation_status_approved": "Approuvé",
+    "validation_status_not_approved": "Non approuvé",
+    "validation_status_on_hold": "En attente",
+}
+
+PARAMETRES_DEFAUT = {
+    "DUREE_MIN_MINUTES": 5,       # en dessous : durée trop courte
+    "DUREE_MAX_MINUTES": 150,     # au-dessus : durée trop longue
+    "PRECISION_GPS_MAX_M": 30,    # au-dessus : GPS non fiable
+    "DISTANCE_DOUBLON_M": 50,     # même nom à moins de 50 m : doublon possible
+    "DELAI_VALIDATION_H": 24,     # délai accordé aux superviseurs pour valider
+    # --- Nouveaux seuils (réglables dans les secrets) ---
+    "QUOTA_PV_PRODUIT": 3,        # un agent ne coche pas un même produit dans plus de 3 PV
+    "ECART_HORLOGE_H": 2,         # écart « end » / réception serveur au-delà duquel l'heure est suspecte
+    "SILENCE_H": 24,              # agent sans aucun envoi depuis plus de 24 h : silence
+    "REOUVERTURE_H": 3,           # fiche commencée un jour, terminée un autre jour plus de 3 h après
+}
+
+# Pondération du score de performance des localités (total = 100)
+POIDS_SCORE = {
+    "Productivité": 20,           # PV par agent et par jour de travail (référence : 3e quartile)
+    "Complétude": 20,             # fiches sans information manquante ou invalide
+    "Fiabilité GPS": 15,          # GPS présent, au Congo, précision ≤ seuil
+    "Durée conforme": 15,         # durée d'entretien entre les deux seuils
+    "Sans doublon": 10,           # fiches non suspectes de doublon
+    "Validation": 20,             # fiches de plus de 24 h traitées par le superviseur
+}
+
+STATUT_QUOTA = "Quota atteint – ne plus cocher"
+STATUT_DEPASSEMENT = "DÉPASSEMENT"
 
 
 class KoboErreur(Exception):
@@ -31,14 +78,14 @@ def _appel(url: str, jeton: str, essais: int = 3) -> dict:
     for k in range(essais):
         try:
             rep = requests.get(url, headers=entetes, timeout=90)
-        except requests.RequestException as e:  # coupure réseau
+        except requests.RequestException as e:
             derniere = e
             time.sleep(3 * (k + 1))
             continue
         if rep.status_code in (401, 403):
             raise KoboErreur("Kobo refuse l'accès (code %s) : vérifiez le jeton API." % rep.status_code)
         if rep.status_code == 404:
-            raise KoboErreur("Formulaire introuvable (404) : vérifiez l'identifiant du formulaire (ASSET_UID) et le serveur.")
+            raise KoboErreur("Formulaire introuvable (404) : vérifiez ASSET_UID et le serveur.")
         if rep.status_code >= 500 or rep.status_code == 429:
             derniere = KoboErreur("Kobo indisponible (code %s)" % rep.status_code)
             time.sleep(3 * (k + 1))
@@ -50,7 +97,6 @@ def _appel(url: str, jeton: str, essais: int = 3) -> dict:
 
 
 def lire_kobo(serveur: str, asset_uid: str, jeton: str) -> tuple[dict, list]:
-    """Renvoie (définition du formulaire, liste des soumissions)."""
     base = serveur.rstrip("/") + "/api/v2/assets/" + asset_uid
     asset = _appel(base + "/?format=json", jeton)
     resultats, url, garde = [], base + "/data/?format=json&limit=1000", 0
@@ -100,14 +146,16 @@ def dictionnaire(content: dict) -> dict:
 
 
 def aplatir(resultats: list, dico: dict) -> tuple[pd.DataFrame, dict]:
-    """Une ligne par soumission, colonnes « Libellé [nom] », codes remplacés par les libellés.
-    Renvoie aussi {entête: type de question}."""
+    """Une ligne par soumission, colonnes « Libellé [nom] », codes remplacés par les libellés."""
     types, lignes = {}, []
     for sub in resultats:
         ligne = {}
         for cle, val in sub.items():
             if cle == "_validation_status":
-                ligne[cle] = (val or {}).get("label", "") if isinstance(val, dict) else ""
+                v = val if isinstance(val, dict) else {}
+                ligne["_validation_status"] = _STATUT_UID.get(v.get("uid", ""), "Non vérifié")
+                ligne["_validation_par"] = v.get("by_whom", "") or ""
+                ligne["_validation_quand"] = v.get("timestamp", "") or ""
                 continue
             if cle == "_geolocation":
                 if isinstance(val, list) and len(val) == 2:
@@ -121,7 +169,7 @@ def aplatir(resultats: list, dico: dict) -> tuple[pd.DataFrame, dict]:
             q = dico["questions"].get(nom, {"libelle": "", "type": "", "liste": ""})
             entete = f"{q['libelle']} [{nom}]" if q["libelle"] else nom
             types[entete] = q["type"]
-            if isinstance(val, list):  # groupe répété
+            if isinstance(val, list):
                 ligne[entete] = f"{len(val)} élément(s)"
                 continue
             texte = "" if val is None else str(val)
@@ -132,7 +180,10 @@ def aplatir(resultats: list, dico: dict) -> tuple[pd.DataFrame, dict]:
                 texte = " ; ".join(liste.get(c, c) for c in texte.split() if c)
             ligne[entete] = texte
         lignes.append(ligne)
-    return pd.DataFrame(lignes).fillna(""), types
+    df = pd.DataFrame(lignes)
+    if "_validation_status" not in df.columns and len(df):
+        df["_validation_status"] = "Non vérifié"
+    return df.fillna(""), types
 
 
 # =====================================================================
@@ -146,14 +197,12 @@ def norm(s) -> str:
 
 
 def _contient(h: str, w: str) -> bool:
-    if re.fullmatch(r"[a-z]+", w):  # mot seul : mot entier
+    if re.fullmatch(r"[a-z]+", w):
         return re.search(r"(^|[^a-z0-9])" + w + r"([^a-z0-9]|$)", h) is not None
     return w in h
 
 
 def col_par_mots(entetes, motifs, exclus=()) -> str | None:
-    """motifs : liste d'alternatives ; chaque alternative = mots tous présents.
-    1er passage sur le libellé seul, 2e passage avec le [nom_technique]."""
     passes = [lambda h: re.sub(r"\s*\[[^\]]*\]\s*$", "", h), lambda h: h]
     for p in passes:
         for m in motifs:
@@ -188,9 +237,11 @@ def detecter_colonnes(df: pd.DataFrame, forcer: dict | None = None) -> dict:
         "validation": col_exacte(E, "_validation_status"),
         "debut": col_exacte(E, "start"),
         "fin": col_exacte(E, "end"),
-        "departement": col_par_mots(E, [["departement"]], ["superviseur"]),
+        "localite": col_par_mots(E, [["localite"], ["superviseur"], ["departement"]]),
+        # Département : question dédiée si elle existe (sinon le département = la localité)
+        "departement": col_par_mots(E, [["departement"]]),
         "nom_pv": col_par_mots(E, [["nom du point de vente"], ["nom", "point de vente"]],
-                               ["responsable", "autre", "preciser"]),
+                               ["responsable", "autre", "preciser", "agent", "enqueteur"]),
         "responsable": col_par_mots(E, [["responsable"]]),
         "quartier": col_par_mots(E, [["quartier"], ["addresse"], ["adresse"]], ["mail", "e-mail"]),
         "telephone": col_par_mots(E, [["numero de telephone"], ["telephone"]], ["autre"]),
@@ -203,13 +254,11 @@ def detecter_colonnes(df: pd.DataFrame, forcer: dict | None = None) -> dict:
         "lon": col_suffixe(E, "_longitude"),
         "prec": col_suffixe(E, "_precision"),
         "gps": col_par_mots(E, [["gps"], ["coordonnees"]], ["_latitude", "_longitude", "_altitude", "_precision"]),
-        "superviseur": col_par_mots(E, [["superviseur"], ["localite"]]),
     }
     agent = col_par_mots(E, [["enqueteur"], ["nom de l'agent"], ["nom", "agent"], ["votre nom"], ["agent"]],
-                         ["superviseur", "responsable", "point de vente"])
+                         ["superviseur", "responsable", "point de vente", "localite"])
     C["agent_source"] = "question" if agent else "compte"
     C["agent"] = agent or col_exacte(E, "_submitted_by") or col_exacte(E, "username") or col_exacte(E, "deviceid")
-    # Corrections manuelles éventuelles (secrets « COLONNES »)
     for k, v in (forcer or {}).items():
         if v:
             trouve = v if v in E else col_par_mots(E, [[norm(v)]])
@@ -220,8 +269,79 @@ def detecter_colonnes(df: pd.DataFrame, forcer: dict | None = None) -> dict:
     return C
 
 
+# Mots qui signalent une question « sous-groupes / rayons » (et non une liste de produits)
+_MOTS_RAYON = ("sous-groupe", "sous groupe", "rayon", "sous-categorie", "sous categorie", "categories de produits")
+
+
+def questions_produits(types: dict, C: dict, colonnes) -> list[str]:
+    """Questions « select_multiple » qui listent des produits élémentaires.
+    On écarte la question des catégories et celles des sous-groupes / rayons."""
+    res = []
+    for e, t in types.items():
+        if t != "select_multiple" or e not in colonnes or e == C.get("categories"):
+            continue
+        lib = norm(re.sub(r"\s*\[[^\]]*\]\s*$", "", e))
+        if any(m in lib for m in _MOTS_RAYON):
+            continue
+        res.append(e)
+    return res
+
+
 # =====================================================================
-# 4. Construction de la base de suivi + contrôles qualité
+# 4. Libellés courts et ordre des types de point de vente
+# =====================================================================
+def libelle_court(s: str, maxi: int = 48) -> str:
+    """« 6.Prestataires privés de services (cliniques, …) » -> « 6. Prestataires privés de services »"""
+    s = re.sub(r"\s*\([^)]*\)?", "", str(s or "")).replace(")", "").strip().rstrip(".:").strip()
+    s = re.sub(r"^(\d+)\s*[.)-]\s*", r"\1. ", s)
+    return s if len(s) <= maxi else s[: maxi - 1].rstrip() + "…"
+
+
+def libelle_produit(s: str, maxi: int = 70) -> str:
+    """« Riz long grain (Mode de présentation du produit : …) » -> « Riz long grain ».
+    Seule la description « (Mode de présentation …) » est retirée : les précisions utiles
+    comme « (baguette française) » sont conservées."""
+    s = re.sub(r"\s*\(\s*mode\s+de\s+pr[ée]sentation.*$", "", str(s or ""), flags=re.I | re.S)
+    s = re.sub(r"\s+", " ", s).strip(" .;:")
+    return s if len(s) <= maxi else s[: maxi - 1].rstrip() + "…"
+
+
+def libelle_categorie(entete: str) -> str:
+    """« (Services administratifs, juridiques) [srv_adm] » -> « Services administratifs, juridiques »"""
+    s = re.sub(r"\s*\[[^\]]*\]\s*$", "", str(entete or "")).strip()
+    s = re.sub(r"^\(\s*(.*?)\s*\)$", r"\1", s).strip(" »>")
+    return s or str(entete)
+
+
+def _numero(s: str) -> float:
+    m = re.match(r"\s*(\d+)", str(s))
+    return float(m.group(1)) if m else math.inf
+
+
+def ordre_types(dico: dict | None, C: dict, observes) -> list[str]:
+    """Libellés complets des types de PV dans l'ordre du formulaire (y compris ceux encore absents)."""
+    ordre = []
+    if dico and C.get("type_pv"):
+        nom = re.search(r"\[([^\]]+)\]\s*$", C["type_pv"])
+        q = dico["questions"].get(nom.group(1) if nom else C["type_pv"], {})
+        ordre = list(dico["choix"].get(q.get("liste", ""), {}).values())
+    for t in observes:
+        if t and t not in ordre:
+            ordre.append(t)
+    return sorted(ordre, key=lambda t: (_numero(t), ordre.index(t)))
+
+
+def separer_localite(s: str) -> tuple[str, str]:
+    """« Dolisie (OGNIMBA Sadri) » -> (« Dolisie », « OGNIMBA Sadri »)"""
+    s = re.sub(r"\s+", " ", str(s or "")).strip()
+    m = re.match(r"^(.*?)\s*\((.*)\)\s*$", s)
+    if m:
+        return m.group(1).strip(" -"), m.group(2).strip()
+    return s, ""
+
+
+# =====================================================================
+# 5. Construction de la base de suivi + contrôles qualité
 # =====================================================================
 def _nombre(v):
     if v is None or v == "":
@@ -234,7 +354,13 @@ def _nombre(v):
 
 
 def nom_propre(s) -> str:
-    s = re.sub(r"\s+", " ", str(s or "")).strip().lower()
+    s = re.sub(r"\s+", " ", str(s or "")).strip()
+    if not s:
+        return ""
+    # Nom de famille en majuscules conservé, sinon mise en forme « Jean Mabiala »
+    if s.isupper():
+        return s
+    s = s.lower()
     return re.sub(r"(^|[\s\-'])(\S)", lambda m: m.group(1) + m.group(2).upper(), s)
 
 
@@ -245,20 +371,35 @@ def distance_m(la1, lo1, la2, lo2) -> float:
     return 2 * 6371000 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-PARAMETRES_DEFAUT = {
-    "DUREE_MIN_MINUTES": 3,
-    "DUREE_MAX_MINUTES": 180,
-    "PRECISION_GPS_MAX_M": 20,
-    "DISTANCE_DOUBLON_M": 50,
-}
+def _heure_locale(serie: pd.Series) -> pd.Series:
+    """Texte ISO (avec ou sans fuseau) -> heure locale de Brazzaville, sans fuseau."""
+    d = pd.to_datetime(serie.replace("", None), errors="coerce", utc=True, format="mixed")
+    return d.dt.tz_convert(FUSEAU).dt.tz_localize(None)
+
+
+def fdate(x, heure=True) -> str:
+    """Date au format français : 15/10/2026 à 21:30."""
+    if x is None or pd.isna(x):
+        return "–"
+    return pd.Timestamp(x).strftime("%d/%m/%Y à %H:%M" if heure else "%d/%m/%Y")
+
+
+def fheures(h) -> str:
+    """Nombre d'heures lisible : 0,5 h · 7 h · 31 h."""
+    if h is None or pd.isna(h):
+        return "–"
+    h = round(float(h), 1) if abs(h) < 10 else round(float(h))
+    return (f"{h:.0f}" if float(h).is_integer() else f"{h:.1f}".replace(".", ",")) + " h"
 
 
 def construire_suivi(df: pd.DataFrame, types: dict, parametres: dict | None = None,
-                     forcer: dict | None = None) -> tuple[pd.DataFrame, dict]:
+                     forcer: dict | None = None, dico: dict | None = None,
+                     maintenant: pd.Timestamp | None = None) -> tuple[pd.DataFrame, dict]:
     P = {**PARAMETRES_DEFAUT, **(parametres or {})}
     if df.empty:
-        return pd.DataFrame(), {}
+        return pd.DataFrame(), {"ordre_types": [], "parametres": P, "questions_produits": []}
     C = detecter_colonnes(df, forcer)
+    maintenant = maintenant if maintenant is not None else pd.Timestamp.now(tz=FUSEAU).tz_localize(None)
 
     def col(k):
         c = C.get(k)
@@ -270,83 +411,109 @@ def construire_suivi(df: pd.DataFrame, types: dict, parametres: dict | None = No
     f["Date_soumission"] = soum.dt.tz_convert(FUSEAU).dt.tz_localize(None)
     f["Jour"] = f["Date_soumission"].dt.date
     f["Heure"] = f["Date_soumission"].dt.strftime("%H:%M")
-    agent = col("agent").map(nom_propre).replace("", "Non identifié")
-    f["Agent"] = agent
-    f["Superviseur"] = col("superviseur")
-    f["Departement"] = col("departement").map(lambda s: s.strip()) if C.get("departement") else ""
+
+    brut_loc = col("localite")
+    parts = brut_loc.map(separer_localite)
+    f["Localite"] = parts.map(lambda p: p[0]).replace("", "Non renseignée")
+    f["Superviseur"] = parts.map(lambda p: p[1])
+    # Département : question dédiée si elle est différente de la localité, sinon = localité
+    if C.get("departement") and C["departement"] != C.get("localite"):
+        f["Departement"] = col("departement").map(lambda s: separer_localite(s)[0]).replace("", "Non renseigné")
+    else:
+        f["Departement"] = f["Localite"]
+    f["Agent"] = col("agent").map(nom_propre).replace("", "Non identifié")
     f["Nom_PV"] = col("nom_pv")
     f["Responsable"] = col("responsable")
     f["Quartier"] = col("quartier")
     f["Telephone"] = col("telephone")
     f["Type_PV"] = col("type_pv")
+    f["Type_PV_court"] = f["Type_PV"].map(lambda s: libelle_court(s) if s else "Non renseigné")
     f["Autre_precise"] = col("autre_precis")
     f["Categories"] = col("categories")
 
-    # GPS : colonnes _latitude/_longitude, sinon champ « lat lon alt précision », sinon _geolocation
-    lat = col("lat").map(_nombre)
-    lon = col("lon").map(_nombre)
-    prec = col("prec").map(_nombre)
+    # GPS
+    lat, lon, prec = col("lat").map(_nombre), col("lon").map(_nombre), col("prec").map(_nombre)
     if C.get("gps"):
-        morceaux = col("gps").str.split()
-        lat = lat.where(lat.notna(), morceaux.map(lambda p: _nombre(p[0]) if isinstance(p, list) and len(p) > 1 else None))
-        lon = lon.where(lon.notna(), morceaux.map(lambda p: _nombre(p[1]) if isinstance(p, list) and len(p) > 1 else None))
-        prec = prec.where(prec.notna(), morceaux.map(lambda p: _nombre(p[3]) if isinstance(p, list) and len(p) > 3 else None))
+        m = col("gps").str.split()
+        lat = lat.where(lat.notna(), m.map(lambda p: _nombre(p[0]) if isinstance(p, list) and len(p) > 1 else None))
+        lon = lon.where(lon.notna(), m.map(lambda p: _nombre(p[1]) if isinstance(p, list) and len(p) > 1 else None))
+        prec = prec.where(prec.notna(), m.map(lambda p: _nombre(p[3]) if isinstance(p, list) and len(p) > 3 else None))
     if "_geo_lat" in df.columns:
         lat = lat.where(lat.notna(), df["_geo_lat"].map(_nombre))
         lon = lon.where(lon.notna(), df["_geo_lon"].map(_nombre))
-    f["Latitude"], f["Longitude"], f["Precision_GPS_m"] = (pd.to_numeric(lat, errors="coerce"),
-                                                           pd.to_numeric(lon, errors="coerce"),
-                                                           pd.to_numeric(prec, errors="coerce"))
+    f["Latitude"] = pd.to_numeric(lat, errors="coerce")
+    f["Longitude"] = pd.to_numeric(lon, errors="coerce")
+    f["Precision_GPS_m"] = pd.to_numeric(prec, errors="coerce")
 
-    # Durée de l'entretien
-    d = pd.to_datetime(col("debut").replace("", None), errors="coerce", utc=True)
-    fi = pd.to_datetime(col("fin").replace("", None), errors="coerce", utc=True)
-    f["Duree_min"] = ((fi - d).dt.total_seconds() / 60).round()
+    # Durée de l'entretien (horloge du téléphone : end - start)
+    f["Debut"] = _heure_locale(col("debut"))      # « start » de la tablette, en heure de Brazzaville
+    f["Fin"] = _heure_locale(col("fin"))          # « end » de la tablette
+    f["Duree_min"] = ((f["Fin"] - f["Debut"]).dt.total_seconds() / 60).round()
+    # Jour de collecte = date de « start » ; à défaut (ou si l'horloge est manifestement fausse :
+    # année < 2020, ou postérieure à la réception) « end », puis la date de réception
+    marge = pd.Timedelta(minutes=10)                         # tolérance de décalage d'horloge
 
-    # Nombre de produits / rayons cochés (toutes les questions à choix multiples sauf « catégories »)
+    def plausible(s):
+        return s.notna() & (s.dt.year >= 2020) & ~(s > f["Date_soumission"] + marge)
+
+    jc = f["Debut"].where(plausible(f["Debut"]), f["Fin"].where(plausible(f["Fin"])))
+    f["Jour_collecte"] = jc.where(jc.notna(), f["Date_soumission"]).dt.date
+
     multi = [e for e, t in types.items() if t == "select_multiple" and e in df.columns and e != C.get("categories")]
-    if multi:
-        f["Nb_produits_coches"] = df[multi].apply(
-            lambda r: sum(len([x for x in str(v).split(" ; ") if x.strip()]) for v in r), axis=1)
-    else:
-        f["Nb_produits_coches"] = 0
-    f["Nb_categories"] = f["Categories"].map(lambda s: len([x for x in s.split(" ; ") if x.strip()]))
-    f["Statut_validation"] = col("validation")
+    f["Nb_produits_coches"] = (df[multi].apply(
+        lambda r: sum(len([x for x in str(v).split(" ; ") if x.strip()]) for v in r), axis=1) if multi else 0)
 
-    # ---- Contrôles qualité ----
-    alertes = {i: [] for i in f.index}
+    # ---- Produits élémentaires cochés : liste de (catégorie, produit) par fiche ----
+    qprod = questions_produits(types, C, df.columns)
+    produits = {i: [] for i in df.index}
+    for q in qprod:
+        cat = libelle_categorie(q)
+        for i, v in df[q].items():
+            for x in str(v).split(" ; "):
+                p = libelle_produit(x)
+                if p:
+                    produits[i].append((cat, p))
+    f["Produits"] = [produits[i] for i in f.index]
+    C["questions_produits"] = qprod
+
+    # Statut de validation
+    f["Statut"] = df["_validation_status"].replace("", "Non vérifié") if "_validation_status" in df.columns else "Non vérifié"
+    f["Valide_par"] = df["_validation_par"] if "_validation_par" in df.columns else ""
+    f["Age_h"] = (maintenant - f["Date_soumission"]).dt.total_seconds() / 3600
+    f["Hors_delai_validation"] = (f["Statut"] == "Non vérifié") & (f["Age_h"] > P["DELAI_VALIDATION_H"])
+
+    # ---- Contrôles qualité (une colonne par famille, pour le score) ----
+    al_comp, al_gps, al_duree = {}, {}, {}
     for i, r in f.iterrows():
-        a = alertes[i]
+        comp, gps, du = [], [], []
         if C["agent_source"] == "question" and r["Agent"] == "Non identifié":
-            a.append("Nom de l'agent manquant")
+            comp.append("Nom de l'agent manquant")
         if not r["Nom_PV"]:
-            a.append("Nom du PV manquant")
-        if pd.isna(r["Latitude"]) or pd.isna(r["Longitude"]):
-            a.append("GPS manquant")
-        else:
-            if not (-5.2 <= r["Latitude"] <= 3.8 and 11 <= r["Longitude"] <= 18.8):
-                a.append("GPS hors du Congo")
-            if pd.notna(r["Precision_GPS_m"]) and r["Precision_GPS_m"] > P["PRECISION_GPS_MAX_M"]:
-                a.append(f"GPS imprécis ({round(r['Precision_GPS_m'])} m)")
+            comp.append("Nom du PV manquant")
         if C.get("type_pv") and not r["Type_PV"]:
-            a.append("Type de PV manquant")
+            comp.append("Type de PV manquant")
         if re.search(r"autre", r["Type_PV"], re.I) and C.get("autre_precis") and not r["Autre_precise"]:
-            a.append("Type « autre » non précisé")
+            comp.append("Type « autre » non précisé")
         if C.get("categories") and not r["Categories"]:
-            a.append("Aucune catégorie de produits")
+            comp.append("Aucune catégorie de produits")
         if r["Telephone"]:
             chiffres = re.sub(r"^(00)?242", "", re.sub(r"\D", "", r["Telephone"]))
             if len(chiffres) != 9:
-                a.append("Téléphone invalide")
+                comp.append("Téléphone invalide")
+        if pd.isna(r["Latitude"]) or pd.isna(r["Longitude"]):
+            gps.append("GPS manquant")
+        elif not (-5.2 <= r["Latitude"] <= 3.8 and 11 <= r["Longitude"] <= 18.8):
+            gps.append("GPS hors du Congo")
+        elif pd.notna(r["Precision_GPS_m"]) and r["Precision_GPS_m"] > P["PRECISION_GPS_MAX_M"]:
+            gps.append(f"GPS non fiable ({round(r['Precision_GPS_m'])} m)")
         if pd.notna(r["Duree_min"]):
             if r["Duree_min"] < P["DUREE_MIN_MINUTES"]:
-                a.append(f"Durée trop courte ({int(r['Duree_min'])} min)")
+                du.append(f"Durée trop courte ({int(r['Duree_min'])} min)")
             elif r["Duree_min"] > P["DUREE_MAX_MINUTES"]:
-                a.append(f"Durée très longue ({int(r['Duree_min'])} min)")
+                du.append(f"Durée trop longue ({int(r['Duree_min'])} min)")
+        al_comp[i], al_gps[i], al_duree[i] = comp, gps, du
 
-    # Doublons possibles :
-    #  - même nom de PV ET à moins de X m (si les deux ont un GPS), ou même quartier (si un GPS manque)
-    #  - ou même téléphone ET même responsable
+    # Doublons possibles
     partenaires = {i: set() for i in f.index}
 
     def doublon(i, j):
@@ -376,23 +543,202 @@ def construire_suivi(df: pd.DataFrame, types: dict, parametres: dict | None = No
         for a_ in range(len(idx)):
             for b_ in range(a_ + 1, len(idx)):
                 doublon(idx[a_], idx[b_])
-    for i, autres in partenaires.items():
-        if autres:
-            ids = sorted(str(f.at[j, "ID"]) for j in autres)
-            alertes[i].append("Doublon possible (ID " + ", ".join(ids[:5]) + (" …" if len(ids) > 5 else "") + ")")
 
-    f["Alertes"] = [" ; ".join(alertes[i]) for i in f.index]
-    f["Nb_alertes"] = [len(alertes[i]) for i in f.index]
+    al_doub = {}
+    for i, autres in partenaires.items():
+        ids = sorted(str(f.at[j, "ID"]) for j in autres)
+        al_doub[i] = ["Doublon possible (ID " + ", ".join(ids[:5]) + (" …" if len(ids) > 5 else "") + ")"] if ids else []
+
+    # ---- Identifiant de PV distinct : les fiches en double d'un même PV sont regroupées ----
+    # (groupes de fiches reliées par la détection de doublons ; clé = plus petit ID du groupe)
+    parent = {i: i for i in f.index}
+
+    def racine(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, autres in partenaires.items():
+        for j in autres:
+            ri, rj = racine(i), racine(j)
+            if ri != rj:
+                parent[max(ri, rj)] = min(ri, rj)
+    groupes = {}
+    for i in f.index:
+        groupes.setdefault(racine(i), []).append(i)
+    cle_pv = {}
+    for membres in groupes.values():
+        ids = sorted((str(f.at[j, "ID"]) for j in membres), key=lambda s: (len(s), s))
+        for j in membres:
+            cle_pv[j] = ids[0] or f"ligne{j}"
+    f["PV_cle"] = [cle_pv[i] for i in f.index]
+
+    f["Alerte_completude"] = [bool(al_comp[i]) for i in f.index]
+    f["Alerte_gps"] = [bool(al_gps[i]) for i in f.index]
+    f["Alerte_duree"] = [bool(al_duree[i]) for i in f.index]
+    f["Alerte_doublon"] = [bool(al_doub[i]) for i in f.index]
+    f["Alertes"] = [" ; ".join(al_comp[i] + al_gps[i] + al_duree[i] + al_doub[i]) for i in f.index]
+    f["Nb_alertes"] = [len(al_comp[i] + al_gps[i] + al_duree[i] + al_doub[i]) for i in f.index]
+
+    # ---- Contrôles d'envoi et d'horloge (tâche 3) ----
+    # Ces alertes sont rangées à part : elles ne modifient ni « Nb_alertes » ni le score /100.
+    limite = pd.to_datetime(f["Jour_collecte"]) + pd.Timedelta(days=1)   # minuit le soir de la collecte
+    f["Envoi_tardif"] = f["Date_soumission"].notna() & (f["Date_soumission"].dt.date > f["Jour_collecte"])
+    f["Retard_h"] = ((f["Date_soumission"] - limite).dt.total_seconds() / 3600).where(f["Envoi_tardif"]).round(1)
+
+    horloge = []
+    for i, r in f.iterrows():
+        d, fi, s = r["Debut"], r["Fin"], r["Date_soumission"]
+        motif = ""
+        if pd.notna(d) and d.year < 2020:
+            motif = f"date de la tablette non réglée (début le {fdate(d)})"
+        elif pd.notna(s) and pd.notna(d) and (d > s + marge or d > maintenant + marge):
+            motif = f"date de début dans le futur (début le {fdate(d)}, reçue le {fdate(s)})"
+        elif pd.notna(s) and pd.notna(fi) and fi > s + marge:
+            ecart = (fi - s).total_seconds() / 3600
+            motif = (f"heure de la tablette en avance de {fheures(ecart)} "
+                     f"(fin de saisie le {fdate(fi)}, reçue le {fdate(s)})")
+        elif pd.notna(s) and pd.notna(fi) and fi.date() == s.date():
+            ecart = (s - fi).total_seconds() / 3600
+            if ecart > P["ECART_HORLOGE_H"]:
+                motif = (f"écart de {fheures(ecart)} entre la fin de saisie ({fi:%H:%M}) et la réception "
+                         f"({s:%H:%M}) – horloge en retard ou envoi différé")
+        horloge.append(motif)
+    f["Alerte_horloge"] = horloge
+    f["Fiche_rouverte"] = (f["Debut"].notna() & f["Fin"].notna() & (f["Debut"].dt.year >= 2020)
+                           & (f["Debut"].dt.date != f["Fin"].dt.date)
+                           & ((f["Fin"] - f["Debut"]).dt.total_seconds() / 3600 > P["REOUVERTURE_H"]))
+
     f = f.sort_values("Date_soumission", ascending=False, na_position="last").reset_index(drop=True)
+    C["ordre_types"] = ordre_types(dico, C, f["Type_PV"].unique())
+    C["parametres"] = P
     return f, C
 
 
+# =====================================================================
+# 6. Tableaux d'analyse
+# =====================================================================
+def tableau_types(f: pd.DataFrame, ordre: list[str]) -> pd.DataFrame:
+    """Type de point de vente | Nbre de points de vente | Pourcentage (ordre du formulaire)."""
+    n = f["Type_PV"].value_counts()
+    lignes = [{"Type de point de vente": libelle_court(t, 80), "Nbre de points de vente": int(n.get(t, 0))} for t in ordre]
+    if (f["Type_PV"] == "").any():
+        lignes.append({"Type de point de vente": "Non renseigné", "Nbre de points de vente": int((f["Type_PV"] == "").sum())})
+    t = pd.DataFrame(lignes, columns=["Type de point de vente", "Nbre de points de vente"])
+    total = int(t["Nbre de points de vente"].sum())
+    t["Pourcentage"] = (t["Nbre de points de vente"] / total * 100).round(1) if total else 0.0
+    t.loc[len(t)] = ["Total", total, 100.0 if total else 0.0]
+    return t
+
+
+def croise_types_localites(f: pd.DataFrame, ordre: list[str]) -> pd.DataFrame:
+    """Lignes = types de PV (ordre du formulaire), colonnes = localités, avec totaux."""
+    locs = f["Localite"].value_counts().index.tolist()
+    lignes = list(ordre) + ([""] if (f["Type_PV"] == "").any() else [])
+    ct = pd.crosstab(f["Type_PV"], f["Localite"]).reindex(index=lignes, columns=locs, fill_value=0)
+    ct.index = [libelle_court(t, 60) if t else "Non renseigné" for t in ct.index]
+    ct["Total"] = ct.sum(axis=1)
+    ct.loc["Total"] = ct.sum(axis=0)
+    ct.index.name = "Type de point de vente"
+    return ct.astype(int)
+
+
+def validation_par_localite(f: pd.DataFrame) -> pd.DataFrame:
+    """Cumul de toutes les fiches de la collecte, par localité / superviseur."""
+    g = f.groupby(["Localite", "Superviseur"])
+    t = pd.crosstab([f["Localite"], f["Superviseur"]], f["Statut"]).reindex(columns=STATUTS, fill_value=0)
+    t.insert(0, "Total fiches", g.size())
+    t["Non vérifiées > 24 h"] = g["Hors_delai_validation"].sum().astype(int)
+    t["% traitées"] = ((t["Total fiches"] - t["Non vérifié"]) / t["Total fiches"] * 100).round(1)
+    return t.sort_values("% traitées", ascending=False).reset_index().rename(
+        columns={"Localite": "Localité"})
+
+
+def validation_par_agent(f: pd.DataFrame) -> pd.DataFrame:
+    g = f.groupby(["Localite", "Agent"])
+    t = pd.crosstab([f["Localite"], f["Agent"]], f["Statut"]).reindex(columns=STATUTS, fill_value=0)
+    t.insert(0, "Total fiches", g.size())
+    t["Non vérifiées > 24 h"] = g["Hors_delai_validation"].sum().astype(int)
+    t["% traitées"] = ((t["Total fiches"] - t["Non vérifié"]) / t["Total fiches"] * 100).round(1)
+    return t.reset_index().rename(columns={"Localite": "Localité"}).sort_values(["Localité", "Agent"])
+
+
+def _pct(s: pd.Series) -> float:
+    return float(s.mean() * 100) if len(s) else float("nan")
+
+
+def performance_localites(f: pd.DataFrame, poids: dict | None = None) -> pd.DataFrame:
+    """Score multicritère /100 par localité. Chaque critère est exprimé en % (100 = parfait),
+    la productivité est rapportée à la meilleure localité."""
+    W = poids or POIDS_SCORE
+    lignes = []
+    for (loc, sup), g in f.groupby(["Localite", "Superviseur"]):
+        agent_jours = g[["Agent", "Jour"]].drop_duplicates().shape[0]
+        anciens = g[g["Age_h"] > 24]
+        lignes.append({
+            "Localité": loc, "Superviseur": sup,
+            "PV identifiés": len(g), "Agents": g["Agent"].nunique(),
+            "PV / agent / jour": len(g) / max(agent_jours, 1),
+            "Complétude": 100 - _pct(g["Alerte_completude"]),
+            "Fiabilité GPS": 100 - _pct(g["Alerte_gps"]),
+            "Durée conforme": 100 - _pct(g["Alerte_duree"]),
+            "Sans doublon": 100 - _pct(g["Alerte_doublon"]),
+            "Validation": _pct(anciens["Statut"] != "Non vérifié") if len(anciens) else 100.0,
+            "Durée médiane (min)": g["Duree_min"].median(),
+        })
+    t = pd.DataFrame(lignes)
+    if t.empty:
+        return t
+    reference = t["PV / agent / jour"].quantile(0.75) or t["PV / agent / jour"].max() or 1
+    t["Productivité"] = (t["PV / agent / jour"] / reference * 100).clip(upper=100)
+    t["Score /100"] = sum(t[k].fillna(100) * w for k, w in W.items()) / sum(W.values())
+    t = t.sort_values("Score /100", ascending=False).reset_index(drop=True)
+    t.insert(0, "Rang", range(1, len(t) + 1))
+    t["Remarque"] = t["PV identifiés"].map(lambda n: "Effectif faible (< 10 fiches)" if n < 10 else "")
+    for c in ["PV / agent / jour"]:
+        t[c] = t[c].round(1)
+    for c in list(W) + ["Score /100"]:
+        t[c] = t[c].round(1)
+    return t
+
+
+def performance_departements(f: pd.DataFrame, poids: dict | None = None) -> pd.DataFrame:
+    """Même score /100 que l'onglet 🏆, calculé au niveau du département."""
+    if f.empty:
+        return pd.DataFrame()
+    g = f.assign(Localite=f["Departement"], Superviseur="")
+    t = performance_localites(g, poids).drop(columns=["Superviseur"])
+    return t.rename(columns={"Localité": "Département"})
+
+
+def performance_agents(f: pd.DataFrame, auj, hier) -> pd.DataFrame:
+    g = f.groupby("Agent")
+    t = pd.DataFrame({
+        "Localité": g["Localite"].agg(lambda s: s.mode().iat[0] if len(s.mode()) else ""),
+        "Total": g.size(),
+        "Aujourd'hui": g["Jour"].apply(lambda s: int((s == auj).sum())),
+        "Hier": g["Jour"].apply(lambda s: int((s == hier).sum())),
+        "Jours actifs": g["Jour"].nunique(),
+        "% sans alerte": g["Nb_alertes"].apply(lambda s: round(float((s == 0).mean() * 100), 0)),
+        "% GPS fiable": g["Alerte_gps"].apply(lambda s: round(float((~s).mean() * 100), 0)),
+        "% durée conforme": g["Alerte_duree"].apply(lambda s: round(float((~s).mean() * 100), 0)),
+        "Durée médiane (min)": g["Duree_min"].median(),
+        "Approuvées": g["Statut"].apply(lambda s: int((s == "Approuvé").sum())),
+        "Dernière fiche": g["Date_soumission"].max(),
+    })
+    t["Moyenne / jour"] = (t["Total"] / t["Jours actifs"].clip(lower=1)).round(1)
+    cols = ["Localité", "Total", "Aujourd'hui", "Hier", "Jours actifs", "Moyenne / jour", "% sans alerte",
+            "% GPS fiable", "% durée conforme", "Durée médiane (min)", "Approuvées", "Dernière fiche"]
+    return t[cols].sort_values(["Localité", "Total"], ascending=[True, False]).reset_index()
+
+
 NOMS_COLONNES = {
-    "agent": "Agent", "superviseur": "Superviseur / localité", "departement": "Département",
+    "localite": "Localité / Superviseur", "departement": "Département", "agent": "Agent",
     "nom_pv": "Nom du PV", "responsable": "Responsable", "quartier": "Adresse / quartier",
     "telephone": "Téléphone", "type_pv": "Type de PV", "autre_precis": "Autre type précisé",
     "categories": "Catégories de produits", "gps": "GPS", "lat": "Latitude", "lon": "Longitude",
-    "prec": "Précision GPS", "debut": "Début entretien", "fin": "Fin entretien",
+    "prec": "Précision GPS", "debut": "Début entretien (start)", "fin": "Fin entretien (end)",
     "soumission": "Date de soumission", "validation": "Statut de validation",
 }
 
@@ -403,8 +749,244 @@ def diagnostic(C: dict) -> pd.DataFrame:
         v = C.get(k)
         if not v and k in ("lat", "lon", "prec") and C.get("gps"):
             v = f"lu dans « {C['gps']} »"
+        if k == "departement" and (not v or v == C.get("localite")):
+            v = "identique à la localité" + (f" (« {v} »)" if v else "")
         lignes.append({"Information": lib, "Question Kobo retenue": v or "— non trouvée —"})
+    qp = C.get("questions_produits", [])
+    lignes.append({"Information": "Listes de produits (règle des 3 PV)",
+                   "Question Kobo retenue": f"{len(qp)} question(s) détectée(s)" if qp else "— aucune trouvée —"})
     if C.get("agent_source") == "compte":
         lignes.append({"Information": "Remarque",
-                       "Question Kobo retenue": "Pas de question « nom de l'agent » : l'agent est le compte Kobo / l'appareil."})
+                       "Question Kobo retenue": "Pas de question « nom de l'agent » : l'agent est le compte Kobo."})
     return pd.DataFrame(lignes)
+
+
+# =====================================================================
+# 7. Règle des 3 points de vente par produit (tâche 1)
+# =====================================================================
+COLONNES_QUOTA = ["Localité", "Agent", "Catégorie", "Produit", "Nb de PV distincts", "Noms/codes des PV", "Statut"]
+
+
+def controle_quota_produits(f: pd.DataFrame, quota: int = 3) -> pd.DataFrame:
+    """Pour chaque agent, produits cochés dans « quota » PV distincts ou plus.
+    Les fiches en double d'un même PV (même PV_cle) ne comptent qu'une fois."""
+    vide = pd.DataFrame(columns=COLONNES_QUOTA + ["Département"])
+    if f.empty or "Produits" not in f.columns:
+        return vide
+    long = f[["ID", "Agent", "Localite", "Departement", "Nom_PV", "PV_cle", "Produits"]].explode("Produits")
+    long = long[long["Produits"].notna()]
+    if long.empty:
+        return vide
+    long["Catégorie"] = long["Produits"].map(lambda p: p[0])
+    long["Produit"] = long["Produits"].map(lambda p: p[1])
+    long["cle"] = long["Produit"].map(norm)            # même produit même s'il figure dans 2 listes
+    # Localité / département principal de chaque agent (pour ranger les lignes)
+    loc_agent = f.groupby("Agent")["Localite"].agg(lambda s: s.mode().iat[0])
+    dep_agent = f.groupby("Agent")["Departement"].agg(lambda s: s.mode().iat[0])
+
+    lignes = []
+    for (agent, _), g in long.groupby(["Agent", "cle"]):
+        pvs = g.groupby("PV_cle")
+        n = pvs.ngroups
+        if n < quota:
+            continue
+        noms = []
+        for _, gp in pvs:
+            nom = next((x for x in gp["Nom_PV"] if x), "(sans nom)")
+            ids = sorted(set(gp["ID"].astype(str)), key=lambda s: (len(s), s))
+            noms.append(f"{nom} (ID {', '.join(ids)})")
+        lignes.append({
+            "Localité": loc_agent.get(agent, ""), "Agent": agent,
+            "Catégorie": " / ".join(sorted(set(g["Catégorie"]))),
+            "Produit": Counter(g["Produit"]).most_common(1)[0][0],
+            "Nb de PV distincts": n, "Noms/codes des PV": " ; ".join(sorted(noms)),
+            "Statut": STATUT_DEPASSEMENT if n > quota else STATUT_QUOTA,
+            "Département": dep_agent.get(agent, ""),
+        })
+    if not lignes:
+        return vide
+    t = pd.DataFrame(lignes)
+    t["_p"] = t["Produit"].map(norm)
+    return t.sort_values(["Localité", "Agent", "_p"]).drop(columns="_p").reset_index(drop=True)
+
+
+# =====================================================================
+# 8. Alertes sur les envois (tâche 3)
+# =====================================================================
+def alertes_envoi(t: pd.DataFrame, base_silence: pd.DataFrame | None, maintenant: pd.Timestamp,
+                  parametres: dict | None = None) -> dict:
+    """Quatre tableaux d'alertes, chacun avec une colonne « Message » prête à lire.
+    t            : fiches filtrées (localité, agent, période…)
+    base_silence : fiches filtrées par localité / agent seulement (les silences ne dépendent pas de la période)
+    """
+    P = {**PARAMETRES_DEFAUT, **(parametres or {})}
+    res = {}
+    vide = t.iloc[0:0] if len(t.columns) else pd.DataFrame(
+        columns=["ID", "Localite", "Departement", "Agent", "Nom_PV", "Jour_collecte", "Date_soumission",
+                 "Debut", "Fin", "Retard_h", "Alerte_horloge", "Fiche_rouverte", "Envoi_tardif"])
+    t = t if len(t) else vide
+
+    # a) Envois tardifs
+    d = t[t["Envoi_tardif"]].copy()
+    d["Message"] = [f"{r.Agent} – fiche du {fdate(r.Jour_collecte, False)} envoyée le {fdate(r.Date_soumission)} "
+                    f"(retard : {fheures(r.Retard_h)})" for r in d.itertuples()]
+    res["tardifs"] = pd.DataFrame({
+        "Localité": d["Localite"], "Département": d["Departement"], "Agent": d["Agent"], "ID": d["ID"],
+        "Point de vente": d["Nom_PV"], "Date de collecte": pd.to_datetime(d["Jour_collecte"]),
+        "Envoyée le": d["Date_soumission"], "Retard (h)": d["Retard_h"], "Message": d["Message"]})
+
+    # b) Silences : aucun envoi depuis plus de SILENCE_H heures
+    b = base_silence if base_silence is not None and len(base_silence) else t
+    lignes, actif, note = [], True, ""
+    if len(b):
+        derniere_globale = b["Date_soumission"].max()
+        if pd.notna(derniere_globale) and (maintenant - derniere_globale).total_seconds() / 3600 > P["SILENCE_H"]:
+            actif = False
+            note = (f"Aucune fiche reçue depuis le {fdate(derniere_globale)} : collecte terminée ou suspendue, "
+                    "le contrôle des silences n'est pas appliqué.")
+        else:
+            for agent, g in b.groupby("Agent"):
+                dern = g["Date_soumission"].max()
+                if pd.isna(dern):
+                    continue
+                h = (maintenant - dern).total_seconds() / 3600
+                if h > P["SILENCE_H"]:
+                    lignes.append({
+                        "Localité": g["Localite"].mode().iat[0], "Département": g["Departement"].mode().iat[0],
+                        "Agent": agent, "Dernier envoi": dern, "Heures sans envoi": round(h, 1),
+                        "Message": f"{agent} n'a envoyé aucun formulaire depuis le {fdate(dern)}"})
+    res["silences"] = pd.DataFrame(lignes, columns=["Localité", "Département", "Agent", "Dernier envoi",
+                                                    "Heures sans envoi", "Message"])
+    res["silence_actif"], res["silence_note"] = actif, note
+
+    # c) Heure de tablette suspecte
+    d = t[t["Alerte_horloge"] != ""].copy()
+    d["Message"] = [f"{r.Agent} – fiche {r.ID} ({r.Nom_PV or 'sans nom'}) : {r.Alerte_horloge}" for r in d.itertuples()]
+    res["horloge"] = pd.DataFrame({
+        "Localité": d["Localite"], "Département": d["Departement"], "Agent": d["Agent"], "ID": d["ID"],
+        "Point de vente": d["Nom_PV"], "Début (start)": d["Debut"], "Fin (end)": d["Fin"],
+        "Reçue le": d["Date_soumission"], "Message": d["Message"]})
+
+    # d) Fiches rouvertes (start et end sur des jours différents, écart important)
+    d = t[t["Fiche_rouverte"]].copy()
+    d["Message"] = [f"{r.Agent} – fiche {r.ID} ({r.Nom_PV or 'sans nom'}) commencée le {fdate(r.Debut)} "
+                    f"et terminée le {fdate(r.Fin)} : modifiée après la collecte ?" for r in d.itertuples()]
+    res["rouvertes"] = pd.DataFrame({
+        "Localité": d["Localite"], "Département": d["Departement"], "Agent": d["Agent"], "ID": d["ID"],
+        "Point de vente": d["Nom_PV"], "Début (start)": d["Debut"], "Fin (end)": d["Fin"],
+        "Écart (h)": ((d["Fin"] - d["Debut"]).dt.total_seconds() / 3600).round(1), "Message": d["Message"]})
+    for k in ("tardifs", "horloge", "rouvertes"):
+        res[k] = res[k].sort_values(["Localité", "Agent"]).reset_index(drop=True)
+    return res
+
+
+LIBELLES_ENVOI = {"tardifs": "Envois tardifs", "silences": "Silences", "horloge": "Heure de tablette suspecte",
+                  "rouvertes": "Fiches rouvertes"}
+
+
+def compteurs_envoi(al: dict, t: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compteurs par agent et par localité pour les quatre types d'alerte d'envoi."""
+    cols = list(LIBELLES_ENVOI.values())
+    if t.empty:
+        return (pd.DataFrame(columns=["Localité", "Agent", "Fiches"] + cols + ["Total alertes"]),
+                pd.DataFrame(columns=["Localité", "Fiches", "Envois tardifs", "Agents en silence",
+                                      "Heure de tablette suspecte", "Fiches rouvertes", "Total alertes"]))
+    agents = t.groupby("Agent").agg(Localité=("Localite", lambda s: s.mode().iat[0]), Fiches=("ID", "count"))
+    for k, lib in LIBELLES_ENVOI.items():
+        agents[lib] = al[k].groupby("Agent").size() if len(al[k]) else 0
+    agents = agents.fillna(0)
+    agents[cols] = agents[cols].astype(int)
+    agents["Total alertes"] = agents[cols].sum(axis=1)
+    agents = agents.reset_index().sort_values(["Total alertes", "Agent"], ascending=[False, True])
+    agents = agents[["Localité", "Agent", "Fiches"] + cols + ["Total alertes"]].reset_index(drop=True)
+    locs = agents.groupby("Localité")[["Fiches"] + cols + ["Total alertes"]].sum().reset_index()
+    locs = locs.rename(columns={"Silences": "Agents en silence"})
+    return agents, locs.sort_values("Total alertes", ascending=False).reset_index(drop=True)
+
+
+# =====================================================================
+# 9. Export Excel de la règle des 3 PV
+# =====================================================================
+def _nom_feuille(nom: str, pris: set) -> str:
+    base = re.sub(r"[\[\]:*?/\\]", "-", str(nom or "Sans localité")).strip()[:31] or "Localité"
+    n, k = base, 2
+    while n.lower() in pris:
+        suff = f" ({k})"
+        n, k = base[: 31 - len(suff)] + suff, k + 1
+    pris.add(n.lower())
+    return n
+
+
+def excel_quota(q: pd.DataFrame, perimetre: str, maintenant: pd.Timestamp, quota: int = 3) -> bytes:
+    """Fichier Excel : feuille « Synthèse » + une feuille par localité (même contenu).
+    Les dépassements (> quota PV) sont surlignés en rouge."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    entete = PatternFill("solid", fgColor="16324F")
+    rouge = PatternFill("solid", fgColor="F8CBCB")
+    orange = PatternFill("solid", fgColor="FFF2CC")
+    trait = Side(style="thin", color="C3C2B7")
+    bord = Border(top=trait, bottom=trait, left=trait, right=trait)
+    largeurs = [18, 24, 28, 38, 12, 70, 30]
+
+    def feuille(ws, d: pd.DataFrame, titre: str):
+        ws["A1"] = titre
+        ws["A1"].font = Font(bold=True, size=13, color="16324F")
+        ws["A2"] = (f"Règle : un agent ne coche pas un même produit dans plus de {quota} points de vente différents. "
+                    f"Situation au {maintenant:%d/%m/%Y à %H:%M} · {perimetre}")
+        ws["A2"].font = Font(italic=True, size=9, color="52514E")
+        for j, c in enumerate(COLONNES_QUOTA, start=1):
+            cel = ws.cell(row=4, column=j, value=c)
+            cel.fill, cel.font, cel.border = entete, Font(bold=True, color="FFFFFF"), bord
+            cel.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for i, r in enumerate(d[COLONNES_QUOTA].itertuples(index=False), start=5):
+            depasse = r[-1] == STATUT_DEPASSEMENT
+            for j, v in enumerate(r, start=1):
+                cel = ws.cell(row=i, column=j, value=v)
+                cel.border = bord
+                cel.alignment = Alignment(vertical="top", wrap_text=j in (3, 4, 6),
+                                          horizontal="center" if j == 5 else None)
+                if depasse:
+                    cel.fill = rouge
+                    cel.font = Font(bold=j == 7, color="9C0006")
+                elif j == 7:
+                    cel.fill = orange
+        if d.empty:
+            ws.cell(row=5, column=1, value="Aucun produit n'a atteint le quota.").font = Font(italic=True)
+        for j, w in enumerate(largeurs, start=1):
+            ws.column_dimensions[get_column_letter(j)].width = w
+        ws.freeze_panes = "A5"
+        ws.auto_filter.ref = f"A4:G{max(5, 4 + len(d))}"
+        ws.page_setup.orientation = "landscape"
+        ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.print_title_rows = "4:4"
+
+    ws = wb.active
+    ws.title = "Synthèse"
+    feuille(ws, q, "Produits à ne plus cocher – synthèse")
+    pris = {"synthèse"}
+    for loc, d in q.groupby("Localité", sort=True):
+        feuille(wb.create_sheet(_nom_feuille(loc, pris)), d, f"Produits à ne plus cocher – {loc}")
+    tampon = io.BytesIO()
+    wb.save(tampon)
+    return tampon.getvalue()
+
+
+def excel_alertes_envoi(al: dict, par_agent: pd.DataFrame, par_loc: pd.DataFrame) -> bytes:
+    """Une feuille par type d'alerte d'envoi + compteurs par agent et par localité."""
+    tampon = io.BytesIO()
+    with pd.ExcelWriter(tampon, engine="openpyxl") as w:
+        par_loc.to_excel(w, sheet_name="Compteurs localités", index=False)
+        par_agent.to_excel(w, sheet_name="Compteurs agents", index=False)
+        for k, lib in LIBELLES_ENVOI.items():
+            al[k].to_excel(w, sheet_name=lib[:31], index=False)
+        for ws in w.book.worksheets:
+            for col in ws.columns:
+                lmax = max(len(str(c.value or "")) for c in col)
+                ws.column_dimensions[col[0].column_letter].width = min(max(10, lmax + 2), 90)
+            ws.freeze_panes = "A2"
+    return tampon.getvalue()
