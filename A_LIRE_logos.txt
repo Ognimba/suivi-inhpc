@@ -1,0 +1,8 @@
+Placez ici les deux logos (format PNG, ces noms exacts) :
+
+  logo_ins.png        -> logo de l'Institut National de la Statistique
+  logo_hiswaca.png    -> logo du projet HISWACA
+
+Ils sont affichés dans le bandeau de l'application et sur la page de garde du rapport Word.
+Si vous avez déjà ces fichiers dans votre dépôt GitHub, gardez-les : rien ne change.
+Sans logos, l'application et le rapport fonctionnent quand même (sans images).
